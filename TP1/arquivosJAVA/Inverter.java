@@ -1,8 +1,6 @@
-
-
 import java.util.*;
 
-public class inversao {
+public class Inverter {
 
     public static void main(String[] args) {
 

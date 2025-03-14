@@ -1,5 +1,5 @@
 
-package TP1.arquivosJAVA;
+
 
 import java.util.Random;
 import java.util.Scanner;

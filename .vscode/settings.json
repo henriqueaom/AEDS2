@@ -1,0 +1,11 @@
+{
+    "files.associations": {
+        "*.sqlbook": "sql",
+        "*.ndjson": "jsonl",
+        "*.dbclient-js": "javascript",
+        "TP02_04.C": "cpp",
+        "TP02_05.C": "cpp",
+        "TP02_06.C": "cpp",
+        "TP02_08.C": "cpp"
+    }
+}

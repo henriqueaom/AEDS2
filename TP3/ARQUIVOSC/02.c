@@ -3,6 +3,7 @@
 #include <string.h>
 #include <stdbool.h>
 #include <time.h> // For date parsing
+#include <locale.h> // For date formatting
 
 // --- Show Structure ---
 typedef struct {
@@ -27,13 +28,12 @@ Show* allShows = NULL;
 int numAllShows = 0;
 int capacityAllShows = 10000; // Initial capacity for allShows
 
-// Function to initialize a Show object
+// Function to initialize a Show object to default/safe values
 void initShow(Show* s) {
     s->cast = NULL;
     s->numCast = 0;
     s->dateAdded = 0;
     s->releaseYear = 0;
-    // Initialize string fields to empty or "NaN" as appropriate during parsing
     strcpy(s->showId, "NaN");
     strcpy(s->type, "NaN");
     strcpy(s->title, "NaN");
@@ -45,29 +45,56 @@ void initShow(Show* s) {
     strcpy(s->description, "NaN");
 }
 
-// Function to free memory allocated for a Show object
+// Function to free memory allocated for a Show object's dynamic members
 void freeShow(Show* s) {
     if (s->cast != NULL) {
         for (int i = 0; i < s->numCast; i++) {
-            free(s->cast[i]);
+            if (s->cast[i] != NULL) { // Defensive check
+                free(s->cast[i]);
+            }
         }
         free(s->cast);
-        s->cast = NULL;
+        s->cast = NULL; // Set to NULL to prevent potential double-free in the future
     }
 }
 
-// Helper to get field or "NaN"
-char* getOrNaN(char* field) {
-    if (field == NULL || strlen(field) == 0 || (strlen(field) == 1 && field[0] == '\r')) {
-        return "NaN";
+// Function to perform a deep copy of a Show object
+Show copyShow(const Show* source) {
+    Show dest;
+    initShow(&dest); // Initialize destination show
+
+    // Copy fixed-size string arrays
+    strcpy(dest.showId, source->showId);
+    strcpy(dest.type, source->type);
+    strcpy(dest.title, source->title);
+    strcpy(dest.director, source->director);
+    strcpy(dest.country, source->country);
+    dest.dateAdded = source->dateAdded;
+    dest.releaseYear = source->releaseYear;
+    strcpy(dest.rating, source->rating);
+    strcpy(dest.duration, source->duration);
+    strcpy(dest.listedIn, source->listedIn);
+    strcpy(dest.description, source->description);
+
+    // Deep copy the cast array
+    dest.numCast = source->numCast;
+    if (source->numCast > 0) {
+        dest.cast = (char**)malloc(source->numCast * sizeof(char*));
+        if (dest.cast == NULL) {
+            fprintf(stderr, "Memory allocation failed for deep copy cast array\n");
+            exit(EXIT_FAILURE);
+        }
+        for (int i = 0; i < source->numCast; i++) {
+            dest.cast[i] = strdup(source->cast[i]); // Allocate and copy each string
+            if (dest.cast[i] == NULL) {
+                fprintf(stderr, "Memory allocation failed for deep copy cast member\n");
+                exit(EXIT_FAILURE);
+            }
+        }
+    } else {
+        dest.cast = NULL; // Ensure it's NULL if no cast
     }
-    // Remove leading/trailing quotes if present (for parsed fields)
-    char* cleanedField = strdup(field);
-    if (cleanedField[0] == '\"' && cleanedField[strlen(cleanedField) - 1] == '\"') {
-        cleanedField[strlen(cleanedField) - 1] = '\0'; // Remove last quote
-        memmove(cleanedField, cleanedField + 1, strlen(cleanedField)); // Remove first quote
-    }
-    return cleanedField;
+    return dest;
 }
 
 // Custom CSV parsing function
@@ -77,36 +104,46 @@ void parseLinhaCSV(char* linha, char** campos, int* numCampos) {
     int charIdx = 0;
     char temp[1000]; // Temporary buffer for each field
 
+    // Remove trailing newline/carriage return from original line
+    linha[strcspn(linha, "\r\n")] = 0;
+
     for (int i = 0; linha[i] != '\0'; i++) {
-        if (linha[i] == '\"') {
+        char c = linha[i];
+        if (c == '\"') {
             inQuotes = !inQuotes;
-        } else if (linha[i] == ',' && !inQuotes) {
+        } else if (c == ',' && !inQuotes) {
             temp[charIdx] = '\0';
-            campos[campoIdx] = strdup(temp);
+            campos[campoIdx] = strdup(temp); // Dynamically allocate for each field
             campoIdx++;
             charIdx = 0;
-            if (campoIdx >= 12) break; // Prevent buffer overflow for campos array
+            if (campoIdx >= 12) { // Prevent buffer overflow for campos array
+                break; // Stop parsing if we have enough fields
+            }
         } else {
-            temp[charIdx++] = linha[i];
+            temp[charIdx++] = c;
+            // Add a check to prevent buffer overflow for temp
+            if (charIdx >= sizeof(temp) - 1) {
+                fprintf(stderr, "Warning: Buffer overflow detected in parseLinhaCSV temp buffer.\n");
+                break; // Or handle error
+            }
         }
     }
     temp[charIdx] = '\0';
-    campos[campoIdx] = strdup(temp);
+    campos[campoIdx] = strdup(temp); // Dynamically allocate for the last field
     *numCampos = campoIdx + 1;
 }
 
-// Function to parse a date string (e.g., "September 24, 2021")
+// Function to parse a date string (e.g., "MMMM d, YYYY")
 time_t parseDate(const char* dateStr) {
     struct tm tm_obj = {0};
     char monthStr[20];
     int day, year;
 
-    // Use sscanf to parse month, day, and year
     if (sscanf(dateStr, "%s %d, %d", monthStr, &day, &year) != 3) {
         return 0; // Invalid date format
     }
 
-    // Convert month string to month number
+    // Convert month string to month number (0-indexed)
     if (strcmp(monthStr, "January") == 0) tm_obj.tm_mon = 0;
     else if (strcmp(monthStr, "February") == 0) tm_obj.tm_mon = 1;
     else if (strcmp(monthStr, "March") == 0) tm_obj.tm_mon = 2;
@@ -127,63 +164,122 @@ time_t parseDate(const char* dateStr) {
     return mktime(&tm_obj);
 }
 
+// Macro to safely copy string data from a source field to a fixed-size destination buffer.
+// It handles "NaN" cases and removes quotes if present.
+#define SAFE_STRCPY(dest, src_field) \
+    do { \
+        if (src_field == NULL || strlen(src_field) == 0) { \
+            strcpy(dest, "NaN"); \
+        } else { \
+            char* temp_src = strdup(src_field); /* Create a mutable copy for cleaning */ \
+            if (temp_src[0] == '\"' && temp_src[strlen(temp_src) - 1] == '\"') { \
+                temp_src[strlen(temp_src) - 1] = '\0'; /* Remove trailing quote */ \
+                memmove(temp_src, temp_src + 1, strlen(temp_src)); /* Remove leading quote */ \
+            } \
+            strcpy(dest, temp_src); \
+            free(temp_src); /* Free the temporary cleaned string */ \
+        } \
+    } while(0)
+
 
 // Function to read a line and populate a Show object
 void lerShow(Show* s, char* linha) {
     initShow(s); // Initialize show with default values
 
-    char* campos[12]; // Max 12 fields
-    int numCampos;
+    char* campos[12]; // Max 12 fields (pointers to dynamically allocated strings)
+    int numCampos = 0; // Initialize to 0
     parseLinhaCSV(linha, campos, &numCampos);
 
+    // Ensure we have at least 12 campos for safe access
+    for (int i = numCampos; i < 12; i++) {
+        campos[i] = strdup(""); // Fill missing fields with empty strings
+    }
+
     // Assign fields, handling "NaN" and parsing as needed
-    strcpy(s->showId, getOrNaN(campos[0]));
-    strcpy(s->type, getOrNaN(campos[1]));
-    strcpy(s->title, getOrNaN(campos[2]));
-    strcpy(s->director, getOrNaN(campos[3]));
+    SAFE_STRCPY(s->showId, campos[0]);
+    SAFE_STRCPY(s->type, campos[1]);
+    SAFE_STRCPY(s->title, campos[2]);
+    SAFE_STRCPY(s->director, campos[3]);
 
     // Handle cast
-    char* elenco = getOrNaN(campos[4]);
-    if (strcmp(elenco, "NaN") != 0) {
-        char* tempElenco = strdup(elenco);
+    char* elenco_raw = campos[4];
+    if (elenco_raw == NULL || strlen(elenco_raw) == 0) {
+        s->cast = NULL;
+        s->numCast = 0;
+    } else {
+        char* tempElenco = strdup(elenco_raw); // Work on a copy of the raw cast string
+        // Remove quotes from the entire cast string if present (e.g., "actor1, actor2")
+        if (tempElenco[0] == '\"' && tempElenco[strlen(tempElenco) - 1] == '\"') {
+            tempElenco[strlen(tempElenco) - 1] = '\0';
+            memmove(tempElenco, tempElenco + 1, strlen(tempElenco));
+        }
+
         char* token = strtok(tempElenco, ",");
         s->numCast = 0;
         while (token != NULL) {
+            // Trim whitespace from token
+            char* trimmed = token;
+            while (*trimmed == ' ') trimmed++; // Trim leading spaces
+            size_t len = strlen(trimmed);
+            while (len > 0 && trimmed[len - 1] == ' ') len--; // Trim trailing spaces
+            trimmed[len] = '\0';
+
             s->numCast++;
             s->cast = (char**)realloc(s->cast, s->numCast * sizeof(char*));
-            s->cast[s->numCast - 1] = strdup(token);
-            // Trim whitespace from cast members
-            char* trimmed = s->cast[s->numCast - 1];
-            while (*trimmed == ' ') trimmed++; // Trim leading spaces
-            s->cast[s->numCast - 1] = trimmed;
+            if (s->cast == NULL) {
+                fprintf(stderr, "Memory allocation failed for cast array\n");
+                exit(EXIT_FAILURE);
+            }
+            s->cast[s->numCast - 1] = strdup(trimmed); // Allocate memory for each cast member string
+            if (s->cast[s->numCast - 1] == NULL) {
+                fprintf(stderr, "Memory allocation failed for cast member string\n");
+                exit(EXIT_FAILURE);
+            }
             token = strtok(NULL, ",");
         }
-        free(tempElenco);
+        free(tempElenco); // Free the copy of the raw cast string
     }
 
-    strcpy(s->country, getOrNaN(campos[5]));
+    SAFE_STRCPY(s->country, campos[5]);
 
-    char* dateStr = getOrNaN(campos[6]);
-    if (strcmp(dateStr, "NaN") != 0) {
-        s->dateAdded = parseDate(dateStr);
+    char* dateStr = campos[6];
+    if (dateStr == NULL || strlen(dateStr) == 0) {
+        s->dateAdded = 0;
     } else {
-        s->dateAdded = 0; // Or some default invalid date value
+        char* cleaned_dateStr = strdup(dateStr);
+        if (cleaned_dateStr[0] == '\"' && cleaned_dateStr[strlen(cleaned_dateStr) - 1] == '\"') {
+            cleaned_dateStr[strlen(cleaned_dateStr) - 1] = '\0';
+            memmove(cleaned_dateStr, cleaned_dateStr + 1, strlen(cleaned_dateStr));
+        }
+        s->dateAdded = parseDate(cleaned_dateStr);
+        free(cleaned_dateStr);
     }
 
-    char* releaseYearStr = getOrNaN(campos[7]);
-    if (strcmp(releaseYearStr, "NaN") != 0) {
-        s->releaseYear = atoi(releaseYearStr);
-    } else {
+    char* releaseYearStr = campos[7];
+    if (releaseYearStr == NULL || strlen(releaseYearStr) == 0) {
         s->releaseYear = 0;
+    } else {
+        char* cleaned_releaseYearStr = strdup(releaseYearStr);
+         if (cleaned_releaseYearStr[0] == '\"' && cleaned_releaseYearStr[strlen(cleaned_releaseYearStr) - 1] == '\"') {
+            cleaned_releaseYearStr[strlen(cleaned_releaseYearStr) - 1] = '\0';
+            memmove(cleaned_releaseYearStr, cleaned_releaseYearStr + 1, strlen(cleaned_releaseYearStr));
+        }
+        s->releaseYear = atoi(cleaned_releaseYearStr);
+        free(cleaned_releaseYearStr);
     }
 
-    strcpy(s->rating, getOrNaN(campos[8]));
-    strcpy(s->duration, getOrNaN(campos[9]));
-    strcpy(s->listedIn, getOrNaN(campos[10]));
-    strcpy(s->description, getOrNaN(campos[11]));
+    SAFE_STRCPY(s->rating, campos[8]);
+    SAFE_STRCPY(s->duration, campos[9]);
+    SAFE_STRCPY(s->listedIn, campos[10]);
+    SAFE_STRCPY(s->description, campos[11]);
+
 
     // Free the temporary fields allocated by parseLinhaCSV
     for (int i = 0; i < numCampos; i++) {
+        free(campos[i]);
+    }
+    // Free the "filler" empty strings if any were added
+    for (int i = numCampos; i < 12; i++) {
         free(campos[i]);
     }
 }
@@ -199,7 +295,12 @@ void formatarShow(const Show* s) {
 
     // Sort and print cast
     if (s->numCast > 0) {
+        // Create a temporary array of pointers for sorting
         char** sortedCast = (char**)malloc(s->numCast * sizeof(char*));
+        if (sortedCast == NULL) {
+            fprintf(stderr, "Memory allocation failed for sortedCast\n");
+            exit(EXIT_FAILURE);
+        }
         for (int i = 0; i < s->numCast; i++) {
             sortedCast[i] = s->cast[i];
         }
@@ -208,7 +309,7 @@ void formatarShow(const Show* s) {
         for (int i = 0; i < s->numCast; i++) {
             printf("%s%s", sortedCast[i], (i == s->numCast - 1) ? "" : ", ");
         }
-        free(sortedCast);
+        free(sortedCast); // Free the temporary array of pointers
     } else {
         printf("NaN");
     }
@@ -239,7 +340,7 @@ typedef struct {
 void initListaShow(ListaShow* lista, int tamanho) {
     lista->array = (Show*)malloc(tamanho * sizeof(Show));
     if (lista->array == NULL) {
-        fprintf(stderr, "Memory allocation failed for ListaShow\n");
+        fprintf(stderr, "Memory allocation failed for ListaShow array\n");
         exit(EXIT_FAILURE);
     }
     lista->n = 0;
@@ -249,46 +350,46 @@ void initListaShow(ListaShow* lista, int tamanho) {
 // Function to free memory used by ListaShow
 void freeListaShow(ListaShow* lista) {
     for (int i = 0; i < lista->n; i++) {
-        freeShow(&lista->array[i]);
+        freeShow(&lista->array[i]); // Free dynamic members of each Show
     }
-    free(lista->array);
+    free(lista->array); // Free the array itself
     lista->array = NULL;
     lista->n = 0;
     lista->capacity = 0;
 }
 
-// InserirInicio: Inserts a show at the beginning
+// InserirInicio: Inserts a show at the beginning (performs deep copy)
 void inserirInicio(ListaShow* lista, Show show) {
     if (lista->n >= lista->capacity) {
         fprintf(stderr, "Error: Lista cheia (list full) - cannot insert at beginning.\n");
         return;
     }
     for (int i = lista->n; i > 0; i--) {
-        lista->array[i] = lista->array[i-1];
+        lista->array[i] = lista->array[i-1]; // Shallow copy (source already deep-copied from previous pos)
     }
-    lista->array[0] = show;
+    lista->array[0] = copyShow(&show); // Deep copy the incoming show
     lista->n++;
 }
 
-// InserirFim: Inserts a show at the end
+// InserirFim: Inserts a show at the end (performs deep copy)
 void inserirFim(ListaShow* lista, Show show) {
     if (lista->n >= lista->capacity) {
         fprintf(stderr, "Error: Lista cheia (list full) - cannot insert at end.\n");
         return;
     }
-    lista->array[lista->n++] = show;
+    lista->array[lista->n++] = copyShow(&show); // Deep copy the incoming show
 }
 
-// Inserir: Inserts a show at a specific position
+// Inserir: Inserts a show at a specific position (performs deep copy)
 void inserir(ListaShow* lista, Show show, int pos) {
     if (lista->n >= lista->capacity || pos < 0 || pos > lista->n) {
         fprintf(stderr, "Error: Posicao invalida ou lista cheia (invalid position or list full) - cannot insert at %d.\n", pos);
         return;
     }
     for (int i = lista->n; i > pos; i--) {
-        lista->array[i] = lista->array[i-1];
+        lista->array[i] = lista->array[i-1]; // Shallow copy (source already deep-copied from previous pos)
     }
-    lista->array[pos] = show;
+    lista->array[pos] = copyShow(&show); // Deep copy the incoming show
     lista->n++;
 }
 
@@ -296,16 +397,17 @@ void inserir(ListaShow* lista, Show show, int pos) {
 Show removerInicio(ListaShow* lista) {
     if (lista->n == 0) {
         fprintf(stderr, "Error: Lista vazia (list empty) - cannot remove from beginning.\n");
-        // Return an empty/invalid Show to indicate error
         Show emptyShow;
         initShow(&emptyShow);
-        return emptyShow;
+        return emptyShow; // Return an empty/invalid Show
     }
-    Show resp = lista->array[0];
+    Show resp = lista->array[0]; // Get the Show object (already a deep copy if inserted correctly)
     for (int i = 0; i < lista->n - 1; i++) {
-        lista->array[i] = lista->array[i+1];
+        lista->array[i] = lista->array[i+1]; // Shift remaining elements
     }
     lista->n--;
+    // The 'resp' Show now owns the memory that was previously in lista->array[0].
+    // It's the caller's responsibility to free it.
     return resp;
 }
 
@@ -318,7 +420,7 @@ Show removerFim(ListaShow* lista) {
         return emptyShow;
     }
     lista->n--;
-    return lista->array[lista->n];
+    return lista->array[lista->n]; // Return the Show object (already a deep copy)
 }
 
 // Remover: Removes and returns the show at a specific position
@@ -329,9 +431,9 @@ Show remover(ListaShow* lista, int pos) {
         initShow(&emptyShow);
         return emptyShow;
     }
-    Show resp = lista->array[pos];
+    Show resp = lista->array[pos]; // Get the Show object
     for (int i = pos; i < lista->n - 1; i++) {
-        lista->array[i] = lista->array[i+1];
+        lista->array[i] = lista->array[i+1]; // Shift remaining elements
     }
     lista->n--;
     return resp;
@@ -345,14 +447,11 @@ void mostrarLista(const ListaShow* lista) {
 }
 
 // --- CSV Reading (Global Map Equivalent) ---
-// In C, a simple array and linear search will be used as a HashMap equivalent for small data.
-// For large datasets, a hash table implementation would be necessary.
-
 void lerCSV(const char* caminho) {
     FILE* file = fopen(caminho, "r");
     if (file == NULL) {
         perror("Error opening file");
-        return;
+        exit(EXIT_FAILURE); // Exit if file cannot be opened
     }
 
     char linha[1024];
@@ -360,20 +459,20 @@ void lerCSV(const char* caminho) {
 
     allShows = (Show*)malloc(capacityAllShows * sizeof(Show));
     if (allShows == NULL) {
-        fprintf(stderr, "Memory allocation failed for allShows\n");
+        fprintf(stderr, "Memory allocation failed for allShows array\n");
         exit(EXIT_FAILURE);
     }
 
     while (fgets(linha, sizeof(linha), file) != NULL) {
         if (numAllShows >= capacityAllShows) {
-            capacityAllShows *= 2;
+            capacityAllShows *= 2; // Double capacity
             allShows = (Show*)realloc(allShows, capacityAllShows * sizeof(Show));
             if (allShows == NULL) {
                 fprintf(stderr, "Memory reallocation failed for allShows\n");
                 exit(EXIT_FAILURE);
             }
         }
-        lerShow(&allShows[numAllShows], linha);
+        lerShow(&allShows[numAllShows], linha); // Parse and populate a Show in the global array
         numAllShows++;
     }
     fclose(file);
@@ -389,16 +488,13 @@ Show* findShowById(const char* showId) {
     return NULL; // Not found
 }
 
-// Function to read a specific line based on showId (similar to lerLinhaPorArquivo in Java)
-// This function is still needed to parse individual lines from CSV for insertion commands
-// and create *new* Show objects for them, rather than directly using the global `allShows`.
-// This is to simulate the Java behavior where `new Show().ler(lerLinhaPorArquivo(arquivo))`
-// creates a distinct object for each insertion.
+// Function to read a specific line from the CSV given a showId
+// Returns a dynamically allocated string, caller must free it.
 char* lerLinhaPorArquivo(const char* showId) {
     FILE* file = fopen("/tmp/disneyplus.csv", "r");
     if (file == NULL) {
         perror("Error opening file");
-        return NULL; // Indicate error
+        return NULL;
     }
 
     char linha[1024];
@@ -407,11 +503,12 @@ char* lerLinhaPorArquivo(const char* showId) {
     char* foundLine = NULL;
     while (fgets(linha, sizeof(linha), file) != NULL) {
         char tempShowId[20];
-        sscanf(linha, "%19[^,]", tempShowId); // Read up to the first comma
-
-        if (strcmp(tempShowId, showId) == 0) {
-            foundLine = strdup(linha); // Duplicate the line to return
-            break;
+        // Read up to the first comma, ensure buffer doesn't overflow
+        if (sscanf(linha, "%19[^,]", tempShowId) == 1) {
+            if (strcmp(tempShowId, showId) == 0) {
+                foundLine = strdup(linha); // Duplicate the line to return
+                break;
+            }
         }
     }
     fclose(file);
@@ -420,99 +517,107 @@ char* lerLinhaPorArquivo(const char* showId) {
 
 
 int main() {
-    // Set locale for date formatting if needed, though not strictly required for this problem.
-    // setlocale(LC_ALL, "en_US.UTF-8");
+    // Set locale for date formatting (optional, but good practice for strftime)
+    setlocale(LC_ALL, "en_US.UTF-8");
 
-    // Load all shows from CSV once
+    // Load all shows from CSV once into the global array
     lerCSV("/tmp/disneyplus.csv");
 
     ListaShow lista;
-    initListaShow(&lista, 1000); // Initialize list with capacity
+    initListaShow(&lista, 1000); // Initialize list with a fixed capacity
 
     char id[20];
     // First part: read IDs and add to the list
     while (scanf("%19s", id) == 1 && strcmp(id, "FIM") != 0) {
         Show* s = findShowById(id);
         if (s != NULL) {
-            inserirFim(&lista, *s); // Insert a copy of the show
+            // Deep copy the Show object from the global allShows array into the list
+            inserirFim(&lista, *s);
         }
     }
 
     int n_commands;
     scanf("%d", &n_commands);
-    getchar(); // Consume the newline character after reading n_commands
+    getchar(); // Consume the leftover newline character after reading n_commands
 
     for (int i = 0; i < n_commands; i++) {
         char commandLine[256];
-        fgets(commandLine, sizeof(commandLine), stdin);
-        commandLine[strcspn(commandLine, "\n")] = 0; // Remove newline
+        if (fgets(commandLine, sizeof(commandLine), stdin) == NULL) {
+            break; // End of input
+        }
+        commandLine[strcspn(commandLine, "\n")] = 0; // Remove trailing newline
 
         char cmd[5];
         char arg1[20]; // For showId or position
         char arg2[20]; // For showId (in I* case)
 
-        sscanf(commandLine, "%s", cmd);
+        sscanf(commandLine, "%s", cmd); // Read the command
 
-        if (strcmp(cmd, "II") == 0) {
-            sscanf(commandLine, "%*s %s", arg1);
+        if (strcmp(cmd, "II") == 0) { // Insert at beginning
+            sscanf(commandLine, "%*s %19s", arg1);
             char* lineFromFile = lerLinhaPorArquivo(arg1);
             if (lineFromFile != NULL) {
                 Show newShow;
-                lerShow(&newShow, lineFromFile);
-                inserirInicio(&lista, newShow);
-                free(lineFromFile);
+                lerShow(&newShow, lineFromFile); // newShow owns its cast memory
+                inserirInicio(&lista, newShow); // Deep copy newShow into the list
+                freeShow(&newShow); // Free newShow's original dynamic members now that it's copied
+                free(lineFromFile); // Free the line read from file
             } else {
                 fprintf(stderr, "Error: Show '%s' not found for insertion.\n", arg1);
             }
-        } else if (strcmp(cmd, "IF") == 0) {
-            sscanf(commandLine, "%*s %s", arg1);
+        } else if (strcmp(cmd, "IF") == 0) { // Insert at end
+            sscanf(commandLine, "%*s %19s", arg1);
             char* lineFromFile = lerLinhaPorArquivo(arg1);
             if (lineFromFile != NULL) {
                 Show newShow;
                 lerShow(&newShow, lineFromFile);
                 inserirFim(&lista, newShow);
+                freeShow(&newShow);
                 free(lineFromFile);
             } else {
                 fprintf(stderr, "Error: Show '%s' not found for insertion.\n", arg1);
             }
-        } else if (strcmp(cmd, "I*") == 0) {
+        } else if (strcmp(cmd, "I*") == 0) { // Insert at specific position
             int pos;
-            sscanf(commandLine, "%*s %d %s", &pos, arg2);
+            sscanf(commandLine, "%*s %d %19s", &pos, arg2);
             char* lineFromFile = lerLinhaPorArquivo(arg2);
             if (lineFromFile != NULL) {
                 Show newShow;
                 lerShow(&newShow, lineFromFile);
                 inserir(&lista, newShow, pos);
+                freeShow(&newShow);
                 free(lineFromFile);
             } else {
                 fprintf(stderr, "Error: Show '%s' not found for insertion.\n", arg2);
             }
-        } else if (strcmp(cmd, "RI") == 0) {
+        } else if (strcmp(cmd, "RI") == 0) { // Remove from beginning
             Show removed = removerInicio(&lista);
             printf("(R) %s\n", removed.title);
-            freeShow(&removed); // Free memory associated with the removed show
-        } else if (strcmp(cmd, "RF") == 0) {
+            freeShow(&removed); // IMPORTANT: Free the dynamic members of the removed Show
+        } else if (strcmp(cmd, "RF") == 0) { // Remove from end
             Show removed = removerFim(&lista);
             printf("(R) %s\n", removed.title);
-            freeShow(&removed); // Free memory associated with the removed show
-        } else if (strcmp(cmd, "R*") == 0) {
+            freeShow(&removed); // IMPORTANT: Free the dynamic members of the removed Show
+        } else if (strcmp(cmd, "R*") == 0) { // Remove from specific position
             int pos;
             sscanf(commandLine, "%*s %d", &pos);
             Show removed = remover(&lista, pos);
             printf("(R) %s\n", removed.title);
-            freeShow(&removed); // Free memory associated with the removed show
+            freeShow(&removed); // IMPORTANT: Free the dynamic members of the removed Show
         }
     }
 
     mostrarLista(&lista);
 
-    // Clean up
-    freeListaShow(&lista);
+    // Clean up all dynamically allocated memory
+    freeListaShow(&lista); // Frees elements in the list and the list array itself
+
     if (allShows != NULL) {
         for (int i = 0; i < numAllShows; i++) {
-            freeShow(&allShows[i]);
+            freeShow(&allShows[i]); // Frees dynamic members of each Show in the global array
         }
-        free(allShows);
+        free(allShows); // Frees the global array itself
+        allShows = NULL;
     }
 
     return 0;
